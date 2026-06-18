@@ -25,7 +25,9 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import os
 import re
+import time
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -37,6 +39,16 @@ from astrbot.api import llm_tool, logger
 from astrbot.api.all import Context, Star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.provider.entities import ProviderRequest
+
+try:
+    # 较新版本（v4.24.2+）：把检索结果注入用户消息尾部并标记不持久化，
+    # 避免污染会话历史、稳住服务端自动前缀缓存。
+    from astrbot.core.agent.message import TextPart
+
+    _HAS_TEXT_PART = True
+except Exception:  # pragma: no cover - 老版本无该模块时退回 system_prompt 注入
+    TextPart = None  # type: ignore[assignment,misc]
+    _HAS_TEXT_PART = False
 
 _USER_AGENT = "AstrBot-WikiSeeker/1.0 (+https://github.com/AstrBotDevs/AstrBot)"
 
@@ -77,6 +89,15 @@ description: 当用户询问游戏、百科、设定、版本机制等需要权�
 
 _DOCSITE_URL_CAP = 500  # 单次 docsite 检索最多考虑的页面 URL 数
 _DOCSITE_FETCH_CONCURRENCY = 5  # docsite 抓取候选页正文的并发上限
+_SITEMAP_TTL = 600  # docsite sitemap 缓存有效期（秒）
+_TIPS_CAP = 50  # SKILL.md 累积经验条目上限，超出丢弃最旧
+_TIPS_INJECT_MAX = 5  # 单次回注给 LLM 的经验条数上限
+_TIPS_INJECT_CHARS = 600  # 单次回注经验块的字符上限
+
+# 解析 SKILL.md 中的经验行：- [时间戳] (站点) 经验正文
+_TIP_LINE_RE = re.compile(r"^-\s*\[([^\]]*)\]\s*\(([^)]*)\)\s*(.+)$")
+# SKILL.md 经验沉淀段的锚点注释；经验条目写在此注释之后
+_TIPS_COMMENT = "<!-- update_wiki_skill 写入的经验条目会追加到下方 -->"
 
 
 def _dig(obj: Any, path: str) -> Any:
@@ -163,15 +184,51 @@ def _html_to_text(raw: str) -> tuple[str, str]:
     return html.unescape(parser.heading), html.unescape(parser.text)
 
 
+# 视为词内字符的范围：拉丁字母数字 + 汉字 + 日文假名 + 朝鲜谚文。
+_TOKEN_CHARS = r"0-9a-z一-鿿぀-ヿ가-힯"
+
+
 def _tokenize(query: str) -> list[str]:
-    """把检索词小写后按非字母数字（含中日韩）边界切分为 token。"""
-    return [t for t in re.split(r"[^0-9a-z一-鿿]+", query.lower()) if t]
+    """把检索词小写后按非字母数字/中日韩字符边界切分为 token。"""
+    return [t for t in re.split(rf"[^{_TOKEN_CHARS}]+", query.lower()) if t]
+
+
+def _kw_hit(keyword: str, msg: str) -> bool:
+    """判断关键词是否命中消息。
+
+    纯 ASCII 关键词（如 ``mc``）用词边界匹配，避免误命中 ``welcome`` 之类子串；
+    含非 ASCII 字符（中日韩）的关键词按子串匹配（CJK 无空格分词）。``msg`` 须已小写。
+    """
+    kw = keyword.lower()
+    if not kw:
+        return False
+    if kw.isascii() and any(c.isalnum() for c in kw):
+        pattern = rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])"
+        return re.search(pattern, msg) is not None
+    return kw in msg
 
 
 def _score(text: str, tokens: list[str]) -> int:
     """统计 text（小写）中命中的 token 总次数。"""
     low = text.lower()
     return sum(low.count(t) for t in tokens)
+
+
+def _no_result(name: str, query: str) -> str:
+    """生成"未检索到相关内容"的占位提示。
+
+    技术性错误只记日志、对 LLM 静默；真正未命中则返回本提示，让 LLM 自行判断
+    如何向用户表达（而非凭记忆编造）。
+    """
+    return f"（未在 {name} 检索到与“{query}”相关的内容）"
+
+
+def _is_placeholder(text: str) -> bool:
+    """判断检索返回是否为"未命中"占位提示（用全角括号包裹）。
+
+    用于避免把占位文本误写入知识库——真实正文以 ``## 标题`` 或正文起头。
+    """
+    return text.lstrip().startswith("（")
 
 
 class Main(Star):
@@ -189,17 +246,72 @@ class Main(Star):
         self.enable_keyword_trigger: bool = self.config.get(
             "enable_keyword_trigger", True
         )
-        self.max_results: int = int(self.config.get("max_search_results", 3))
-        self.max_extract_chars: int = int(self.config.get("max_extract_chars", 2000))
-        self.request_timeout: int = int(self.config.get("request_timeout", 10))
+        self.max_results: int = self._int_cfg("max_search_results", 3)
+        self.max_extract_chars: int = self._int_cfg("max_extract_chars", 2000)
+        self.request_timeout: int = self._int_cfg("request_timeout", 10)
+        self.keyword_trigger_timeout: int = self._int_cfg("keyword_trigger_timeout", 8)
+        self.max_inject_chars: int = self._int_cfg("max_inject_chars", 4000)
         self.enable_kb: bool = self.config.get("enable_kb", False)
         self.embedding_provider_id: str = self.config.get("embedding_provider_id", "")
-        self.kb_chunk_size: int = int(self.config.get("kb_chunk_size", 512))
+        self.kb_chunk_size: int = self._int_cfg("kb_chunk_size", 512)
         self.enable_skill_evolution: bool = self.config.get(
             "enable_skill_evolution", True
         )
+        # 全局网络代理（如 http://127.0.0.1:7890）；仅对 use_proxy=true 的站点生效。
+        self.proxy: str = (self.config.get("proxy", "") or "").strip()
 
         self._skill_md = Path(__file__).parent / "skills" / "wiki-search" / "SKILL.md"
+        # 经验闭环：内存中保存已沉淀的经验，供 _tips_for 回注给 LLM。
+        self._tips: list[dict] = []
+        self._skill_lock = asyncio.Lock()
+        # docsite sitemap 缓存：{sitemap_url: (写入时刻 monotonic, urls)}。
+        self._sitemap_cache: dict[str, tuple[float, list[str]]] = {}
+
+    def _int_cfg(self, key: str, default: int) -> int:
+        """安全读取 int 配置：非法值记 warning 并退回默认值，不让 initialize 崩。"""
+        raw = self.config.get(key, default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"[WikiSeeker] 配置 {key}={raw!r} 非合法整数，已使用默认值 {default}。"
+            )
+            return default
+
+    def _parse_tips(self) -> list[dict]:
+        """从 SKILL.md 解析已沉淀的经验条目为 [{ts, site, tip}]。"""
+        tips: list[dict] = []
+        if not self._skill_md.exists():
+            return tips
+        try:
+            text = self._skill_md.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"[WikiSeeker] 读取 SKILL.md 失败：{e}")
+            return tips
+        for line in text.splitlines():
+            m = _TIP_LINE_RE.match(line.strip())
+            if m:
+                tips.append(
+                    {"ts": m.group(1), "site": m.group(2), "tip": m.group(3).strip()}
+                )
+        return tips
+
+    def _tips_for(self, site_name: str) -> str:
+        """取该站点 + general 的经验，拼成简短回注块；无经验返回空串。"""
+        if not self._tips:
+            return ""
+        relevant = [
+            t
+            for t in self._tips
+            if t["site"] == site_name or t["site"].lower() == "general"
+        ]
+        if not relevant:
+            return ""
+        lines = [f"- {t['tip']}" for t in relevant[-_TIPS_INJECT_MAX:]]
+        block = "检索经验提示（来自历史沉淀）：\n" + "\n".join(lines)
+        if len(block) > _TIPS_INJECT_CHARS:
+            block = block[:_TIPS_INJECT_CHARS] + "…"
+        return block
 
     async def initialize(self) -> None:
         """加载站点配置、校验依赖、准备 skill 与 HTTP 会话。"""
@@ -217,6 +329,9 @@ class Main(Star):
         if not self._skill_md.exists():
             self._skill_md.parent.mkdir(parents=True, exist_ok=True)
             self._skill_md.write_text(_DEFAULT_SKILL_MD, encoding="utf-8")
+
+        # 把 SKILL.md 中已沉淀的经验解析到内存，供纯聊天场景回注
+        self._tips = self._parse_tips()
 
         self._session = aiohttp.ClientSession(headers={"User-Agent": _USER_AGENT})
 
@@ -279,6 +394,8 @@ class Main(Star):
                 "mode": mode,
                 "kb_name": item.get("kb_name", ""),
                 "keywords": [k for k in item.get("keywords", []) if k],
+                # 该站点是否走全局代理：use_proxy=true 且已配 proxy 才生效，否则直连。
+                "proxy": self.proxy if (item.get("use_proxy") and self.proxy) else None,
             }
 
             if stype == "mediawiki":
@@ -331,12 +448,15 @@ class Main(Star):
 
             self.sites[name] = site
 
-    async def _api_get(self, endpoint: str, params: dict[str, Any]) -> dict:
+    async def _api_get(
+        self, endpoint: str, params: dict[str, Any], proxy: str | None = None
+    ) -> dict:
         """发起 MediaWiki Action API GET 请求并返回 JSON。
 
         Args:
             endpoint: 站点 api.php 地址。
             params: 查询参数。
+            proxy: 该请求使用的代理地址（None 表示直连）。
 
         Returns:
             解析后的 JSON 字典。
@@ -348,19 +468,22 @@ class Main(Star):
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         try:
             async with self._session.get(
-                endpoint, params=params, timeout=timeout
+                endpoint, params=params, timeout=timeout, proxy=proxy
             ) as resp:
                 resp.raise_for_status()
                 return await resp.json()
         except Exception as e:
             raise RuntimeError(str(e)) from e
 
-    async def _fetch_extracts(self, endpoint: str, titles: list[str]) -> dict[str, str]:
+    async def _fetch_extracts(
+        self, endpoint: str, titles: list[str], proxy: str | None = None
+    ) -> dict[str, str]:
         """批量获取页面纯文本正文。
 
         Args:
             endpoint: 站点 api.php 地址。
             titles: 页面标题列表。
+            proxy: 该请求使用的代理地址（None 表示直连）。
 
         Returns:
             {标题: 正文} 字典，正文已按 max_extract_chars 截断。
@@ -378,6 +501,7 @@ class Main(Star):
                 "format": "json",
                 "formatversion": "2",
             },
+            proxy=proxy,
         )
         out: dict[str, str] = {}
         for page in data.get("query", {}).get("pages", []):
@@ -386,8 +510,12 @@ class Main(Star):
                 out[page.get("title", "")] = extract[: self.max_extract_chars]
         return out
 
-    async def _search_site(self, site: dict, query: str) -> str:
-        """按站点 type 分派到对应后端检索，返回拼接好的正文文本。"""
+    async def _search_site(self, site: dict, query: str) -> str | None:
+        """按站点 type 分派到对应后端检索。
+
+        返回拼接好的正文文本；技术性错误返回 None（仅记日志、对 LLM 静默），
+        真正未命中返回占位提示。
+        """
         stype = site.get("type", "mediawiki")
         if stype == "http_api":
             return await self._search_http_api(site, query)
@@ -395,10 +523,11 @@ class Main(Star):
             return await self._search_docsite(site, query)
         return await self._search_mediawiki(site, query)
 
-    async def _search_mediawiki(self, site: dict, query: str) -> str:
+    async def _search_mediawiki(self, site: dict, query: str) -> str | None:
         """MediaWiki Action API 检索：先 list=search 取标题，再 prop=extracts 取正文。"""
         name = site["name"]
         endpoint = site["api_endpoint"]
+        proxy = site.get("proxy")
         try:
             data = await self._api_get(
                 endpoint,
@@ -411,21 +540,23 @@ class Main(Star):
                     "formatversion": "2",
                     "utf8": "1",
                 },
+                proxy=proxy,
             )
         except RuntimeError as e:
+            # 网络/HTTP 等技术性错误：仅记日志，不把错误细节回给 LLM
             logger.warning(f"[WikiSeeker] 站点 {name} 搜索失败：{e}")
-            return f"（{name} 检索失败：{e}）"
+            return None
 
         hits = data.get("query", {}).get("search", [])
         if not hits:
-            return f"（在 {name} 未找到与“{query}”相关的条目）"
+            return _no_result(name, query)
 
         titles = [h["title"] for h in hits if h.get("title")]
         try:
-            extracts = await self._fetch_extracts(endpoint, titles)
+            extracts = await self._fetch_extracts(endpoint, titles, proxy=proxy)
         except RuntimeError as e:
             logger.warning(f"[WikiSeeker] 站点 {name} 取正文失败：{e}")
-            return f"（{name} 取正文失败：{e}）"
+            return None
 
         parts = []
         for title in titles:
@@ -433,13 +564,14 @@ class Main(Star):
             if text:
                 parts.append(f"## {title}\n{text}")
         if not parts:
-            return f"（在 {name} 找到条目但无正文摘要）"
+            return _no_result(name, query)
         return "\n\n".join(parts)
 
-    async def _search_http_api(self, site: dict, query: str) -> str:
+    async def _search_http_api(self, site: dict, query: str) -> str | None:
         """通用自定义 HTTP API 检索：按用户配置发请求并用点分路径映射结果字段。"""
         assert self._session is not None
         name = site["name"]
+        proxy = site.get("proxy")
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         headers = dict(site.get("headers") or {})
         try:
@@ -453,6 +585,7 @@ class Main(Star):
                     data=body.encode("utf-8"),
                     headers=headers,
                     timeout=timeout,
+                    proxy=proxy,
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
@@ -465,18 +598,24 @@ class Main(Star):
                     params=params,
                     headers=headers,
                     timeout=timeout,
+                    proxy=proxy,
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
         except Exception as e:
+            # 技术性错误：仅记日志（严禁打印 headers/请求体，含密钥），对 LLM 静默
             logger.warning(f"[WikiSeeker] 站点 {name}(http_api) 请求失败：{e}")
-            return f"（{name} 检索失败：{e}）"
+            return None
 
         results = _dig(data, site["results_path"]) if site["results_path"] else data
         if not isinstance(results, list):
-            return f"（{name} 响应中未按 results_path 取到结果列表）"
+            # results_path 配错或响应结构不符：属配置/解析问题，记日志、不回给 LLM
+            logger.warning(
+                f"[WikiSeeker] 站点 {name}(http_api) 未按 results_path 取到结果列表。"
+            )
+            return None
         if not results:
-            return f"（在 {name} 未找到与“{query}”相关的条目）"
+            return _no_result(name, query)
 
         parts = []
         for item in results[: self.max_results]:
@@ -488,17 +627,31 @@ class Main(Star):
                 head = f"## {title}\n" if title else ""
                 parts.append(f"{head}{content}".strip())
         if not parts:
-            return (
-                f"（在 {name} 找到结果但 title/content 字段映射为空，请检查字段路径）"
+            # 字段映射全空：title_field/content_field 配错，记日志、不回给 LLM
+            logger.warning(
+                f"[WikiSeeker] 站点 {name}(http_api) title/content 字段映射为空，"
+                "请检查字段路径。"
             )
+            return None
         return "\n\n".join(parts)
 
-    async def _fetch_sitemap_urls(self, sitemap_url: str, name: str) -> list[str]:
-        """抓取并解析 sitemap，返回页面 URL 列表（对 .xml 子 sitemap 递归一层）。"""
+    async def _fetch_sitemap_urls(
+        self, sitemap_url: str, name: str, proxy: str | None = None
+    ) -> list[str]:
+        """抓取并解析 sitemap，返回页面 URL 列表（对 .xml 子 sitemap 递归一层）。
+
+        sitemap 短期内基本不变，按 ``_SITEMAP_TTL`` 缓存，避免每次检索重抓重解析。
+        """
         assert self._session is not None
+        cached = self._sitemap_cache.get(sitemap_url)
+        if cached and time.monotonic() - cached[0] < _SITEMAP_TTL:
+            return cached[1]
+
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         try:
-            async with self._session.get(sitemap_url, timeout=timeout) as resp:
+            async with self._session.get(
+                sitemap_url, timeout=timeout, proxy=proxy
+            ) as resp:
                 resp.raise_for_status()
                 xml = await resp.text()
         except Exception as e:
@@ -512,7 +665,9 @@ class Main(Star):
             if loc.lower().endswith(".xml"):
                 # sitemap index：递归抓一层子 sitemap
                 try:
-                    async with self._session.get(loc, timeout=timeout) as r2:
+                    async with self._session.get(
+                        loc, timeout=timeout, proxy=proxy
+                    ) as r2:
                         r2.raise_for_status()
                         sub = await r2.text()
                     pages += [
@@ -530,19 +685,25 @@ class Main(Star):
                 pages.append(loc)
             if len(pages) >= _DOCSITE_URL_CAP:
                 break
-        return pages[:_DOCSITE_URL_CAP]
+        pages = pages[:_DOCSITE_URL_CAP]
+        if pages:
+            self._sitemap_cache[sitemap_url] = (time.monotonic(), pages)
+        return pages
 
-    async def _search_docsite(self, site: dict, query: str) -> str:
+    async def _search_docsite(self, site: dict, query: str) -> str | None:
         """静态文档站检索：sitemap 列页 → URL 初筛 → 抓正文 → 关键词重排。"""
         assert self._session is not None
         name = site["name"]
+        proxy = site.get("proxy")
         tokens = _tokenize(query)
         if not tokens:
-            return f"（{name} 检索词为空）"
+            logger.warning(f"[WikiSeeker] 站点 {name}(docsite) 检索词为空，跳过。")
+            return None
 
-        pages = await self._fetch_sitemap_urls(site["sitemap_url"], name)
+        pages = await self._fetch_sitemap_urls(site["sitemap_url"], name, proxy=proxy)
         if not pages:
-            return f"（{name} 未能从 sitemap 获取页面列表）"
+            # sitemap 抓取/解析失败（内部已记日志）：技术性问题，对 LLM 静默
+            return None
 
         # URL 路径初筛：命中 token 越多越靠前；全 0 则取前若干兜底
         ranked = sorted(pages, key=lambda u: _score(u, tokens), reverse=True)
@@ -555,7 +716,9 @@ class Main(Star):
         async def fetch(url: str) -> tuple[str, str, str] | None:
             async with sem:
                 try:
-                    async with self._session.get(url, timeout=timeout) as resp:
+                    async with self._session.get(
+                        url, timeout=timeout, proxy=proxy
+                    ) as resp:
                         resp.raise_for_status()
                         raw = await resp.text()
                 except Exception:
@@ -569,7 +732,9 @@ class Main(Star):
             r for r in await asyncio.gather(*(fetch(u) for u in candidates)) if r
         ]
         if not fetched:
-            return f"（{name} 命中页面但无法提取正文）"
+            # 候选页全部抓取/解析失败：技术性问题，对 LLM 静默
+            logger.warning(f"[WikiSeeker] 站点 {name}(docsite) 候选页均无法提取正文。")
+            return None
 
         # 用正文命中度重排，取 top max_results
         scored = sorted(fetched, key=lambda r: _score(r[2], tokens), reverse=True)
@@ -579,7 +744,7 @@ class Main(Star):
                 continue
             parts.append(f"## {title}\n{text[: self.max_extract_chars]}\n来源：{url}")
         if not parts:
-            return f"（在 {name} 未找到与“{query}”相关的内容）"
+            return _no_result(name, query)
         return "\n\n".join(parts)
 
     async def _retrieve_kb(self, kb_name: str, query: str) -> str | None:
@@ -620,7 +785,7 @@ class Main(Star):
         except Exception as e:
             logger.warning(f"[WikiSeeker] 知识库 {kb_name} 入库失败：{e}")
 
-    async def _resolve(self, site: dict, query: str) -> str:
+    async def _resolve(self, site: dict, query: str) -> str | None:
         """按站点 mode 决定走知识库还是实时检索。"""
         if site["mode"] == "static" and self.enable_kb and site.get("kb_name"):
             hit = await self._retrieve_kb(site["kb_name"], query)
@@ -628,31 +793,89 @@ class Main(Star):
                 return hit
             # 知识库未命中：实时检索后回存（static 站点内容稳定，可长期缓存）
             text = await self._search_site(site, query)
-            await self._upload_to_kb(site["kb_name"], query, text)
+            # 仅回存真实正文；错误（None）与"未命中"占位提示都不入库
+            if text and not _is_placeholder(text):
+                await self._upload_to_kb(site["kb_name"], query, text)
             return text
         return await self._search_site(site, query)
 
+    def _site_block(self, site: dict, text: str) -> str:
+        """拼一个站点的注入块：经验提示（若有）+ 检索结果。"""
+        tips = self._tips_for(site["name"])
+        head = f"【{site['name']} 检索结果】"
+        body = f"{tips}\n{text}" if tips else text
+        return f"{head}\n{body}"
+
+    def _inject(self, req: ProviderRequest, block: str) -> None:
+        """把检索块注入本次请求。
+
+        优先用 ``extra_user_content_parts``（注入用户消息尾部、标记不持久化，稳住自动前缀
+        缓存且不污染会话历史）；老版本无该能力时退回追加 ``system_prompt``。
+        """
+        payload = (
+            "以下是从 Wiki 检索到的相关资料，请优先依据这些准确信息作答，"
+            f"并在必要时注明来源：\n{block}"
+        )
+        if _HAS_TEXT_PART and hasattr(req, "extra_user_content_parts"):
+            try:
+                part = TextPart(text=payload)
+                if hasattr(part, "mark_as_temp"):
+                    part = part.mark_as_temp()
+                req.extra_user_content_parts.append(part)
+                return
+            except Exception as e:
+                logger.warning(
+                    f"[WikiSeeker] 注入 extra_user_content_parts 失败，退回 system_prompt：{e}"
+                )
+        req.system_prompt = (req.system_prompt or "") + "\n\n" + payload
+
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
-        """关键词命中时预检索 wiki 并注入本次 LLM 请求的 system_prompt。"""
+        """关键词命中时并发预检索 wiki 并注入本次 LLM 请求（带整体超时，不阻塞回复）。"""
         if not self.enable_keyword_trigger or not self.sites:
             return
-        msg = (event.message_str or "").lower()
+        raw = event.message_str or ""
+        msg = raw.lower()
         if not msg:
             return
 
-        injected = []
-        for site in self.sites.values():
-            if any(k.lower() in msg for k in site["keywords"]):
-                text = await self._resolve(site, event.message_str)
-                if text:
-                    injected.append(f"【{site['name']} 检索结果】\n{text}")
-        if injected:
-            block = "\n\n".join(injected)
-            req.system_prompt = (req.system_prompt or "") + (
-                "\n\n以下是从 Wiki 检索到的相关资料，请优先依据这些准确信息作答，"
-                f"并在必要时注明来源：\n{block}"
+        matched = [
+            site
+            for site in self.sites.values()
+            if any(_kw_hit(k, msg) for k in site["keywords"])
+        ]
+        if not matched:
+            return
+
+        # 并发检索，整体超时；超时则保留已就绪的部分结果，不阻塞回复
+        tasks = {asyncio.ensure_future(self._resolve(s, raw)): s for s in matched}
+        done, pending = await asyncio.wait(tasks, timeout=self.keyword_trigger_timeout)
+        for t in pending:
+            t.cancel()
+        if pending:
+            names = ", ".join(tasks[t]["name"] for t in pending)
+            logger.warning(
+                f"[WikiSeeker] 关键词预检索超时（{self.keyword_trigger_timeout}s），"
+                f"跳过站点：{names}"
             )
+
+        injected = []
+        for t in done:
+            site = tasks[t]
+            try:
+                text = t.result()
+            except Exception as e:
+                logger.warning(f"[WikiSeeker] 站点 {site['name']} 预检索异常：{e}")
+                continue
+            if text:
+                injected.append(self._site_block(site, text))
+        if not injected:
+            return
+
+        block = "\n\n".join(injected)
+        if len(block) > self.max_inject_chars:
+            block = block[: self.max_inject_chars] + "\n…（内容过长已截断）"
+        self._inject(req, block)
 
     @llm_tool("search_wiki")
     async def search_wiki(
@@ -674,10 +897,24 @@ class Main(Star):
         else:
             targets = list(self.sites.values())
 
+        # 多站点并发检索，避免串行累加延迟
+        texts = await asyncio.gather(
+            *(self._resolve(site, query) for site in targets),
+            return_exceptions=True,
+        )
         results = []
-        for site in targets:
-            text = await self._resolve(site, query)
-            results.append(f"【{site['name']}】\n{text}")
+        for site, text in zip(targets, texts):
+            # 技术性错误（异常或 None）只记日志、跳过该站，不把错误细节回给 LLM
+            if isinstance(text, Exception):
+                logger.warning(f"[WikiSeeker] 站点 {site['name']} 检索异常：{text}")
+                continue
+            if not text:
+                continue
+            tips = self._tips_for(site["name"])
+            body = f"{tips}\n{text}" if tips else text
+            results.append(f"【{site['name']}】\n{body}")
+        if not results:
+            return "未检索到相关内容。"
         return "\n\n".join(results)
 
     @llm_tool("save_to_kb")
@@ -702,7 +939,9 @@ class Main(Star):
             )
         kb_name = site.get("kb_name") or site_name
         try:
-            extracts = await self._fetch_extracts(site["api_endpoint"], [page_title])
+            extracts = await self._fetch_extracts(
+                site["api_endpoint"], [page_title], proxy=site.get("proxy")
+            )
         except RuntimeError as e:
             return f"获取页面失败：{e}"
         text = extracts.get(page_title) or next(iter(extracts.values()), "")
@@ -723,15 +962,39 @@ class Main(Star):
         """
         if not self.enable_skill_evolution:
             return "skill 进化功能未启用。"
-        try:
+        tip = (tip or "").strip()
+        if not tip:
+            return "经验内容为空，未记录。"
+        site_name = (site_name or "general").strip() or "general"
+
+        async with self._skill_lock:
+            if any(t["site"] == site_name and t["tip"] == tip for t in self._tips):
+                return "该经验此前已记录，无需重复。"
             ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-            entry = f"- [{ts}] ({site_name}) {tip}\n"
-            existing = (
-                self._skill_md.read_text(encoding="utf-8")
-                if self._skill_md.exists()
-                else _DEFAULT_SKILL_MD
-            )
-            self._skill_md.write_text(existing + entry, encoding="utf-8")
-        except Exception as e:
-            return f"记录经验失败：{e}"
+            self._tips.append({"ts": ts, "site": site_name, "tip": tip})
+            if len(self._tips) > _TIPS_CAP:
+                self._tips = self._tips[-_TIPS_CAP:]
+            try:
+                self._write_skill_md()
+            except Exception as e:
+                logger.warning(f"[WikiSeeker] 写入 SKILL.md 失败：{e}")
+                return f"记录经验失败：{e}"
         return "已记录该经验，后续检索会参考。"
+
+    def _write_skill_md(self) -> None:
+        """以 self._tips 为准重建 SKILL.md 的经验段并原子落盘。"""
+        base = (
+            self._skill_md.read_text(encoding="utf-8")
+            if self._skill_md.exists()
+            else _DEFAULT_SKILL_MD
+        )
+        idx = base.find(_TIPS_COMMENT)
+        if idx >= 0:
+            header = base[: idx + len(_TIPS_COMMENT)]
+        else:
+            header = _DEFAULT_SKILL_MD.rstrip("\n")
+        lines = [f"- [{t['ts']}] ({t['site']}) {t['tip']}" for t in self._tips]
+        content = header + "\n" + "\n".join(lines) + "\n"
+        tmp = self._skill_md.with_name(self._skill_md.name + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, self._skill_md)

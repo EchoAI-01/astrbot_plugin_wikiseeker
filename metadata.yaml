@@ -1,9 +1,13 @@
 name: astrbot_plugin_wikiseeker
 author: Chen
 display_name: Wiki Seeker
-short_desc: 让 LLM 主动检索 MediaWiki 站点获取准确信息，支持关键词触发、知识库沉淀与 skill 自进化
+short_desc: 让 LLM 主动检索 MediaWiki / 自定义 HTTP API / 静态文档站获取准确信息，支持关键词触发、知识库沉淀与 skill 自进化
 desc: >-
-  Wiki Seeker — 让 LLM 在回复前主动从 MediaWiki 站点检索准确信息。支持多站点配置、关键词预搜索注入、
-  LLM 自助调用工具搜索、与主动回复插件兼容；可将不再更新的游戏 wiki 沉淀进知识库，并把搜索经验持续沉淀为 skill。
-version: "1.0.0"
+  Wiki Seeker — 让 LLM 在回复前主动从多种知识源检索准确信息，支持三类检索后端：MediaWiki 百科、
+  通用自定义 HTTP API（Notion/语雀/Confluence/飞书等任意 API+密钥的笔记库）、静态文档站
+  （Docusaurus/VuePress/VitePress/GitBook）。默认内置维基百科（中/英）、Minecraft Wiki、Fandom 与
+  灰机 Wiki 示例站，可自由增删多站点；支持网络代理（按站点开关，便于访问维基百科/Fandom 等站点）、
+  关键词预搜索注入、LLM 自助工具搜索、与主动回复插件兼容；可将不再更新的资料沉淀进知识库，
+  并把搜索经验持续沉淀为 skill。
+version: "1.2.0"
 astrbot_version: ">=4.0.0"

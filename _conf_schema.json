@@ -2,8 +2,8 @@
   "wiki_sites": {
     "description": "Wiki 站点列表（JSON 数组）",
     "type": "string",
-    "default": "[\n  {\n    \"name\": \"minecraft-zh\",\n    \"api_endpoint\": \"https://zh.minecraft.wiki/api.php\",\n    \"description\": \"中文 Minecraft（我的世界）百科，包含方块、物品、生物、合成、机制等\",\n    \"language\": \"zh\",\n    \"mode\": \"live\",\n    \"kb_name\": \"\",\n    \"keywords\": [\"我的世界\", \"minecraft\", \"mc\"]\n  }\n]",
-    "hint": "JSON 数组。通用字段：name(唯一标识)、type(mediawiki默认/http_api/docsite)、description(给 LLM 判断用途)、mode(live=实时搜索 / static=优先走知识库)、kb_name(关联知识库名，static 必填)、keywords(命中即触发预搜索的关键词数组)。【type=mediawiki】api_endpoint(api.php 地址)、language。【type=http_api 通用API+密钥，兼容Notion/语雀/Confluence/飞书等】api_endpoint(搜索URL)、method(GET/POST)、headers(对象，放认证如{\"Authorization\":\"Bearer xxx\"}或{\"X-Auth-Token\":\"xxx\"})、query_param(GET时检索词参数名如q)、extra_params(GET额外固定参数)、body_template(POST请求体JSON模板，用{query}占位)、results_path(响应中结果数组的点分路径如data)、title_field/content_field(每项标题/正文的点分路径，支持数字索引如properties.title.0.plain_text)。例-语雀GET:{\"name\":\"yuque\",\"type\":\"http_api\",\"api_endpoint\":\"https://www.yuque.com/api/v2/search\",\"headers\":{\"X-Auth-Token\":\"xxx\"},\"query_param\":\"q\",\"extra_params\":{\"type\":\"doc\"},\"results_path\":\"data\",\"title_field\":\"title\",\"content_field\":\"summary\"}。例-Notion POST:{\"type\":\"http_api\",\"method\":\"POST\",\"api_endpoint\":\"https://api.notion.com/v1/search\",\"headers\":{\"Authorization\":\"Bearer xxx\",\"Notion-Version\":\"2022-06-28\"},\"body_template\":\"{\\\"query\\\":\\\"{query}\\\"}\",\"results_path\":\"results\"}。【type=docsite 静态文档站Docsify/VuePress/Docusaurus/GitBook】base_url(站点根)、sitemap_url(可选，默认base_url/sitemap.xml)。例:{\"name\":\"docs\",\"type\":\"docsite\",\"base_url\":\"https://docusaurus.io\"}。"
+    "default": "[\n  {\n    \"name\": \"wikipedia-zh\",\n    \"api_endpoint\": \"https://zh.wikipedia.org/w/api.php\",\n    \"description\": \"中文维基百科：通用百科知识（人物、历史、科学、地理、作品等）\",\n    \"language\": \"zh\",\n    \"mode\": \"live\",\n    \"use_proxy\": true,\n    \"keywords\": [\"维基百科\", \"维基\", \"wikipedia\"]\n  },\n  {\n    \"name\": \"wikipedia-en\",\n    \"api_endpoint\": \"https://en.wikipedia.org/w/api.php\",\n    \"description\": \"英文维基百科：英文通用百科知识，条目更全\",\n    \"language\": \"en\",\n    \"mode\": \"live\",\n    \"use_proxy\": true,\n    \"keywords\": [\"英文维基\", \"enwiki\"]\n  },\n  {\n    \"name\": \"minecraft-zh\",\n    \"api_endpoint\": \"https://zh.minecraft.wiki/api.php\",\n    \"description\": \"中文 Minecraft（我的世界）百科：方块、物品、生物、合成、机制等\",\n    \"language\": \"zh\",\n    \"mode\": \"live\",\n    \"keywords\": [\"我的世界\", \"minecraft\", \"mc\"]\n  },\n  {\n    \"name\": \"terraria-fandom\",\n    \"api_endpoint\": \"https://terraria.fandom.com/api.php\",\n    \"description\": \"Terraria（泰拉瑞亚）Fandom 百科【示例：可改子域接入任意 Fandom 站 xxx.fandom.com/api.php】\",\n    \"mode\": \"live\",\n    \"use_proxy\": true,\n    \"keywords\": [\"泰拉瑞亚\", \"terraria\"]\n  },\n  {\n    \"name\": \"dontstarve-huiji\",\n    \"api_endpoint\": \"https://dontstarve.huijiwiki.com/api.php\",\n    \"description\": \"饥荒（Don't Starve）灰机 Wiki【示例：可改子域接入任意灰机站 xxx.huijiwiki.com/api.php】\",\n    \"mode\": \"live\",\n    \"keywords\": [\"饥荒\", \"dont starve\"]\n  }\n]",
+    "hint": "JSON 数组。通用字段：name(唯一标识)、type(mediawiki默认/http_api/docsite)、description(给 LLM 判断用途)、mode(live=实时搜索 / static=优先走知识库)、kb_name(关联知识库名，static 必填)、keywords(命中即触发预搜索的关键词数组)、use_proxy(bool，该站点是否走全局 proxy 配置；维基百科/Fandom 等被墙站点设 true，灰机等国内站不填或 false)。默认已内置维基百科(中/英)、Minecraft Wiki、Terraria Fandom(示例)、饥荒灰机(示例)；所有站点都可加多个配置项，按需增删。巴哈姆特(gamer.com.tw)无公开搜索 API，如需接入可尝试 docsite(若提供 sitemap)或 http_api(若有 JSON 接口)。【type=mediawiki】api_endpoint(api.php 地址，维基百科为 /w/api.php)、language。【type=http_api 通用API+密钥，兼容Notion/语雀/Confluence/飞书等】api_endpoint(搜索URL)、method(GET/POST)、headers(对象，放认证如{\"Authorization\":\"Bearer xxx\"}或{\"X-Auth-Token\":\"xxx\"})、query_param(GET时检索词参数名如q)、extra_params(GET额外固定参数)、body_template(POST请求体JSON模板，用{query}占位)、results_path(响应中结果数组的点分路径如data)、title_field/content_field(每项标题/正文的点分路径，支持数字索引如properties.title.0.plain_text)。例-语雀GET:{\"name\":\"yuque\",\"type\":\"http_api\",\"api_endpoint\":\"https://www.yuque.com/api/v2/search\",\"headers\":{\"X-Auth-Token\":\"xxx\"},\"query_param\":\"q\",\"extra_params\":{\"type\":\"doc\"},\"results_path\":\"data\",\"title_field\":\"title\",\"content_field\":\"summary\"}。例-Notion POST:{\"type\":\"http_api\",\"method\":\"POST\",\"api_endpoint\":\"https://api.notion.com/v1/search\",\"headers\":{\"Authorization\":\"Bearer xxx\",\"Notion-Version\":\"2022-06-28\"},\"body_template\":\"{\\\"query\\\":\\\"{query}\\\"}\",\"results_path\":\"results\"}。【type=docsite 静态文档站Docsify/VuePress/Docusaurus/GitBook】base_url(站点根)、sitemap_url(可选，默认base_url/sitemap.xml)。例:{\"name\":\"docs\",\"type\":\"docsite\",\"base_url\":\"https://docusaurus.io\"}。"
   },
   "enable_llm_tool": {
     "description": "启用 search_wiki 工具（LLM 自助判断何时搜索）",
@@ -27,9 +27,27 @@
     "default": 2000
   },
   "request_timeout": {
-    "description": "MediaWiki API 请求超时（秒）",
+    "description": "单次网络请求超时（秒，MediaWiki/http_api/docsite 所有后端共用）",
     "type": "int",
     "default": 10
+  },
+  "proxy": {
+    "description": "全局网络代理地址（用于访问维基百科/Fandom 等被墙站点）",
+    "type": "string",
+    "default": "",
+    "hint": "如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。仅对 wiki_sites 中 use_proxy=true 的站点生效；留空则所有站点直连。灰机等国内站请保持 use_proxy 不填，避免走代理变慢。"
+  },
+  "keyword_trigger_timeout": {
+    "description": "关键词预搜索的整体超时（秒）。超时则跳过注入，避免阻塞回复",
+    "type": "int",
+    "default": 8,
+    "hint": "命中多个站点时会并发检索；此值是整体预算，超时则用已就绪的部分结果。"
+  },
+  "max_inject_chars": {
+    "description": "关键词预搜索单次注入上下文的字符上限",
+    "type": "int",
+    "default": 4000,
+    "hint": "超出会截断，避免注入过长抬高 token 消耗。"
   },
   "enable_kb": {
     "description": "启用知识库功能（沉淀与检索）",
