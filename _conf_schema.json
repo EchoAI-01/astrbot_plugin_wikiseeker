@@ -1,0 +1,56 @@
+{
+  "wiki_sites": {
+    "description": "Wiki 站点列表（JSON 数组）",
+    "type": "string",
+    "default": "[\n  {\n    \"name\": \"minecraft-zh\",\n    \"api_endpoint\": \"https://zh.minecraft.wiki/api.php\",\n    \"description\": \"中文 Minecraft（我的世界）百科，包含方块、物品、生物、合成、机制等\",\n    \"language\": \"zh\",\n    \"mode\": \"live\",\n    \"kb_name\": \"\",\n    \"keywords\": [\"我的世界\", \"minecraft\", \"mc\"]\n  }\n]",
+    "hint": "JSON 数组。通用字段：name(唯一标识)、type(mediawiki默认/http_api/docsite)、description(给 LLM 判断用途)、mode(live=实时搜索 / static=优先走知识库)、kb_name(关联知识库名，static 必填)、keywords(命中即触发预搜索的关键词数组)。【type=mediawiki】api_endpoint(api.php 地址)、language。【type=http_api 通用API+密钥，兼容Notion/语雀/Confluence/飞书等】api_endpoint(搜索URL)、method(GET/POST)、headers(对象，放认证如{\"Authorization\":\"Bearer xxx\"}或{\"X-Auth-Token\":\"xxx\"})、query_param(GET时检索词参数名如q)、extra_params(GET额外固定参数)、body_template(POST请求体JSON模板，用{query}占位)、results_path(响应中结果数组的点分路径如data)、title_field/content_field(每项标题/正文的点分路径，支持数字索引如properties.title.0.plain_text)。例-语雀GET:{\"name\":\"yuque\",\"type\":\"http_api\",\"api_endpoint\":\"https://www.yuque.com/api/v2/search\",\"headers\":{\"X-Auth-Token\":\"xxx\"},\"query_param\":\"q\",\"extra_params\":{\"type\":\"doc\"},\"results_path\":\"data\",\"title_field\":\"title\",\"content_field\":\"summary\"}。例-Notion POST:{\"type\":\"http_api\",\"method\":\"POST\",\"api_endpoint\":\"https://api.notion.com/v1/search\",\"headers\":{\"Authorization\":\"Bearer xxx\",\"Notion-Version\":\"2022-06-28\"},\"body_template\":\"{\\\"query\\\":\\\"{query}\\\"}\",\"results_path\":\"results\"}。【type=docsite 静态文档站Docsify/VuePress/Docusaurus/GitBook】base_url(站点根)、sitemap_url(可选，默认base_url/sitemap.xml)。例:{\"name\":\"docs\",\"type\":\"docsite\",\"base_url\":\"https://docusaurus.io\"}。"
+  },
+  "enable_llm_tool": {
+    "description": "启用 search_wiki 工具（LLM 自助判断何时搜索）",
+    "type": "bool",
+    "default": true
+  },
+  "enable_keyword_trigger": {
+    "description": "启用关键词预搜索注入（命中关键词时在 LLM 请求前自动搜索并注入上下文）",
+    "type": "bool",
+    "default": true
+  },
+  "max_search_results": {
+    "description": "每个站点取回的搜索结果（页面）数量上限",
+    "type": "int",
+    "default": 3,
+    "hint": "建议 1-5。数量越多注入上下文越长、越耗 token。"
+  },
+  "max_extract_chars": {
+    "description": "单个页面正文截断字符数",
+    "type": "int",
+    "default": 2000
+  },
+  "request_timeout": {
+    "description": "MediaWiki API 请求超时（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "enable_kb": {
+    "description": "启用知识库功能（沉淀与检索）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启前必须配置 embedding_provider_id，否则插件会自动降级为不使用知识库。"
+  },
+  "embedding_provider_id": {
+    "description": "知识库使用的 Embedding Provider ID",
+    "type": "string",
+    "default": "",
+    "hint": "在 AstrBot 服务提供商中配置 Embedding 类型供应商后填写其 ID。"
+  },
+  "kb_chunk_size": {
+    "description": "知识库入库时的分块大小（字符）",
+    "type": "int",
+    "default": 512
+  },
+  "enable_skill_evolution": {
+    "description": "启用 update_wiki_skill 工具（允许 LLM 把搜索经验沉淀进 SKILL.md）",
+    "type": "bool",
+    "default": true
+  }
+}
